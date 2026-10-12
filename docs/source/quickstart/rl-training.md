@@ -6,6 +6,7 @@ This guide demonstrates:
 
 1. Train `Qwen3-Coder-30B-A3B-Instruct` with the white-box `ReAct Agent`.
 2. Train `Qwen3-Coder-30B-A3B-Instruct` with the black-box `Claude Code` Agent.
+3. Train `Qwen3.5-4B` with the white-box `ReAct Agent` on 32 H100 GPUs.
 
 ## Prerequisites
 
@@ -324,3 +325,56 @@ Outputs are written under:
 The following dashboard summarizes reward, SWE-Bench Verified performance, rollout behavior, throughput, timing, and policy-drift metrics for this run:
 
 ![Claude Code Qwen3-Coder-30B-A3B-Instruct training metrics](../assets/results_claude_code_qwen3_coder_30b.svg){ width="1200" }
+
+## Case 3: Qwen3.5-4B ReAct RL on 32 H100 GPUs
+
+### Launch Training
+
+`train_qwen3p5_4b_h100_32g.sh` trains `Qwen3.5-4B` with the ReAct Task Config in `colocate_async` mode on 4 nodes x 8 H100 GPUs. Its defaults are the complete recipe, so only the data and runtime roots are required:
+
+```bash
+DATA_DIR=/path/to/data \
+RUNTIME_DIR=/path/to/runtime \
+bash examples/quickstart/training/train_qwen3p5_4b_h100_32g.sh
+```
+
+The defaults are:
+
+| Group | Setting |
+| --- | --- |
+| Batch | 64 prompts x 8 rollouts per step, PPO mini-batch 16, 2 warmup batches (3 batches in flight) |
+| Objective | GRPO with std-normalized advantages, PPO clip 0.2 / 0.28, dual-clip 10, `seq-mean-token-mean` loss |
+| KL | `low_var_kl` loss with coefficient 1e-3; no KL in reward |
+| Rollout correction | Token-level TIS with threshold 2.0 on top of recomputed old log-probs |
+| Optimizer | Adam, LR 1e-6 constant after 10 warmup steps, weight decay 0.1, betas (0.9, 0.98) |
+| Lengths | 8K prompt, 128K response; sampling temperature 1.0, top-p 1.0 |
+| Parallelism | Megatron TP1 / PP1 / CP4 with full recompute and CPU offload; vLLM TP1 |
+| Rollout | FlashAttention 3, MTP speculative decoding with 2 draft tokens, 1536 concurrent sessions |
+
+Every value can be overridden with the environment variables defined at the top of the script; extra Hydra overrides can be appended as arguments. Set `ENABLE_MTP=False` for checkpoints without an MTP layer, and `ROLLOUT_ATTENTION_BACKEND=` to let vLLM choose its attention backend on non-Hopper GPUs.
+
+Training attention uses Transformer Engine's `flash` backend, which prefers FlashAttention 3 when the `flash-attn-3` package is installed. If the first log-prob pass fails with `_flash_attn_forward() got an unexpected keyword argument 'window_size_left'`, the installed `flash-attn-3` predates the API your Transformer Engine expects; install a matching `flash-attn-3` or remove it from the training image so TE uses FlashAttention 2.
+
+The script expects:
+
+```text
+<DATA_DIR>/
+├── models/Qwen3.5-4B/
+└── data/uni_agent/
+    ├── swe_rebench_filtered_1150.parquet
+    └── swe_bench_verified.parquet
+
+<RUNTIME_DIR>/
+├── data/uni_agent/runtime_env.yaml
+├── ckpts/
+└── logs/
+```
+
+### Monitor the Run
+
+Outputs are written under:
+
+```text
+<RUNTIME_DIR>/ckpts/Uni-Agent-Qwen3.5-4B-megatron-32g/<EXP_NAME>/
+<RUNTIME_DIR>/logs/Uni-Agent-Qwen3.5-4B-megatron-32g/<EXP_NAME>/
+```
