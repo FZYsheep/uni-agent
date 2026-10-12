@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Qwen3.5-4B ReAct GRPO on SWE-reBench, colocate_async on 32 H100 GPUs (4 nodes x 8).
+# Qwen3.5-4B ReAct GRPO on SWE-reBench, colocate_async on 64 H100 GPUs (8 nodes x 8).
 # Run from the repository root. Extra Hydra overrides can be appended as arguments.
 set -xeuo pipefail
 
-project_name=${PROJECT_NAME:-"Uni-Agent-Qwen3.5-4B-megatron-32g"}
+project_name=${PROJECT_NAME:-"Uni-Agent-Qwen3.5-4B-megatron-64g"}
 exp_name=${EXP_NAME:-"$(date +%Y%m%d%H)_exp"}
 
 MODEL_PATH=${MODEL_PATH:-"${DATA_DIR}/models/Qwen3.5-4B"}
@@ -93,7 +93,7 @@ USE_DIST_CKPT=${USE_DIST_CKPT:-False}
 
 # V1 colocate_async topology: actor + rollout share every GPU (rollout replicas sleep during
 # the train step), so NNODES is the total node count.
-NNODES=${NNODES:-4}
+NNODES=${NNODES:-8}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
 train_prompt_bsz=${TRAIN_PROMPT_BSZ:-64}
