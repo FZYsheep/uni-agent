@@ -17,7 +17,7 @@ AGENT_LOG_DIR=${AGENT_LOG_DIR:-"${RUNTIME_DIR}/logs/${project_name}/${exp_name}"
 TASK_CONFIG=${TASK_CONFIG:-"examples/quickstart/training/task_config_react.yaml"}
 TOOL_PARSER=${TOOL_PARSER:-"qwen3_coder"}    # gateway tool-call parser; MUST match the model chat template
 GATEWAY_COUNT=${GATEWAY_COUNT:-32}           # gateway actors fronting the engines
-CONCURRENCY=${CONCURRENCY:-1536}             # max in-flight rollout sessions (runner cap)
+CONCURRENCY=${CONCURRENCY:-1024}             # max in-flight rollout sessions (runner cap)
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-"$(basename "${MODEL_PATH}")"}
 MASK_UNFINISHED_EPISODE=${MASK_UNFINISHED_EPISODE:-False}  # opt-in: zero the loss mask for unfinished episodes
 
@@ -81,10 +81,6 @@ CE_BACKEND=${CE_BACKEND:-nccl}  # weight-sync checkpoint engine
 # carry the MTP layer, so the rollout engine loads the real checkpoint (load_format=auto).
 ENABLE_MTP=${ENABLE_MTP:-True}
 MTP_NUM_SPECULATIVE_TOKENS=${MTP_NUM_SPECULATIVE_TOKENS:-2}
-# vLLM attention backend; FLASH_ATTN selects FlashAttention 3 on Hopper. Empty keeps vLLM's choice.
-ROLLOUT_ATTENTION_BACKEND=${ROLLOUT_ATTENTION_BACKEND-FLASH_ATTN}
-# Extra piecewise CUDA graph sizes past vLLM's 512 default ("a,b,c"; empty keeps the default grid).
-ROLLOUT_CUDAGRAPH_EXTRA_SIZES=${ROLLOUT_CUDAGRAPH_EXTRA_SIZES-544,576,1072,1104,1600,1632,2128,2160}
 
 # install mbridge
 # pip3 install git+https://github.com/ISEEKYAN/mbridge
@@ -128,23 +124,6 @@ if [[ "${ENABLE_MTP}" == "True" ]]; then
     )
 else
     mtp_overrides=()
-fi
-
-if [[ -n "${ROLLOUT_ATTENTION_BACKEND}" ]]; then
-    attention_overrides=(++actor_rollout_ref.rollout.engine_kwargs.vllm.attention_backend="${ROLLOUT_ATTENTION_BACKEND}")
-    if [[ "${ROLLOUT_ATTENTION_BACKEND}" == "FLASH_ATTN" ]]; then
-        attention_overrides+=(++actor_rollout_ref.rollout.engine_kwargs.vllm.attention_config.flash_attn_version=3)
-    fi
-else
-    attention_overrides=()
-fi
-
-if [[ -n "${ROLLOUT_CUDAGRAPH_EXTRA_SIZES}" ]]; then
-    # vLLM's default grid up to 512, followed by the extra sizes.
-    cg_sizes=$( { echo 1 2 4; seq 8 8 248; seq 256 16 512; echo "${ROLLOUT_CUDAGRAPH_EXTRA_SIZES//,/ }"; } | tr -s ' \n' ',' | sed 's/,$//')
-    cudagraph_overrides=(actor_rollout_ref.rollout.cudagraph_capture_sizes="[${cg_sizes}]")
-else
-    cudagraph_overrides=()
 fi
 
 ray job submit --no-wait --runtime-env "${RUNTIME_ENV}" \
@@ -271,8 +250,6 @@ ray job submit --no-wait --runtime-env "${RUNTIME_ENV}" \
     actor_rollout_ref.nccl_timeout=9600 \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=True \
-    "${cudagraph_overrides[@]}" \
-    "${attention_overrides[@]}" \
     "${mtp_overrides[@]}" \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.ref.megatron.use_dist_checkpointing=${USE_DIST_CKPT} \
