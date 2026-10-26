@@ -1886,6 +1886,134 @@ async def test_generate_sequences_keeps_other_prompts_when_one_prompt_fails(fake
     assert all(session_id.startswith("session-sample-1-rollout-0-") for session_id in runtime.finalized_sessions)
 
 
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_submit_sessions_returns_after_admission_before_rollout_completion(fake_tq):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def runner(**_kwargs):
+        started.set()
+        await release.wait()
+
+    runtime = _FakeGatewayManager({"session-sample-0-rollout-0": [_trajectory()]})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={
+            "runner": {
+                **_inline_runner_config(runner),
+                "max_concurrent_sessions": 1,
+            }
+        },
+        gateway_manager=runtime,
+    )
+
+    await asyncio.wait_for(framework.submit_sessions(_build_prompts(count=1, global_steps=3)), 2)
+    await asyncio.wait_for(started.wait(), 2)
+    assert not runtime.finalized_sessions
+    assert framework._rollout_tasks
+
+    release.set()
+    await asyncio.wait_for(asyncio.gather(*list(framework._rollout_tasks)), 2)
+    assert runtime.finalized_sessions == runtime.created_sessions
+    assert not framework._rollout_tasks
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_submit_sessions_waits_for_runner_capacity(fake_tq):
+    started: asyncio.Queue[asyncio.Event] = asyncio.Queue()
+
+    async def runner(**_kwargs):
+        release = asyncio.Event()
+        started.put_nowait(release)
+        await release.wait()
+
+    runtime = _FakeGatewayManager({"session-sample-0-rollout-0": [_trajectory()]})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={
+            "runner": {
+                **_inline_runner_config(runner),
+                "max_concurrent_sessions": 1,
+            }
+        },
+        gateway_manager=runtime,
+    )
+
+    await asyncio.wait_for(framework.submit_sessions(_build_prompts(count=1, global_steps=3)), 2)
+    first_release = await asyncio.wait_for(started.get(), 2)
+    second = asyncio.create_task(framework.submit_sessions(_build_prompts(count=1, global_steps=3)))
+    done, _ = await asyncio.wait((second,), timeout=0.05)
+    assert not done
+
+    first_release.set()
+    await asyncio.wait_for(second, 2)
+    second_release = await asyncio.wait_for(started.get(), 2)
+    second_release.set()
+    await asyncio.wait_for(asyncio.gather(*list(framework._rollout_tasks)), 2)
+    assert framework._runner_semaphores["runner"]._value == 1
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_submit_sessions_propagates_admission_failure(monkeypatch, fake_tq):
+    async def runner(**_kwargs):
+        return None
+
+    runtime = _FakeGatewayManager({})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(runner)},
+        gateway_manager=runtime,
+    )
+
+    async def reject_episode(**_kwargs):
+        raise ValueError("admission rejected")
+
+    monkeypatch.setattr(framework, "_submit_agent_episode", reject_episode)
+
+    with pytest.raises(ValueError, match="admission rejected"):
+        await asyncio.wait_for(framework.submit_sessions(_build_prompts(count=1, global_steps=3)), 2)
+
+    assert [put["tag"]["status"] for put in fake_tq.puts] == ["running", "failure"]
+    assert not framework._rollout_tasks
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_cancelled_admission_aborts_started_episode_and_releases_capacity(fake_tq):
+    started = asyncio.Event()
+
+    async def runner(**_kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    runtime = _FakeGatewayManager({})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={
+            "runner": {
+                **_inline_runner_config(runner),
+                "max_concurrent_sessions": 1,
+            }
+        },
+        gateway_manager=runtime,
+        n=2,
+    )
+
+    submission = asyncio.create_task(framework.submit_sessions(_build_prompts(count=1, global_steps=3)))
+    await asyncio.wait_for(started.wait(), 2)
+    submission.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(submission, 2)
+
+    assert runtime.aborted_sessions == runtime.created_sessions
+    assert framework._runner_semaphores["runner"]._value == 1
+    assert [put["tag"]["status"] for put in fake_tq.puts] == ["running", "failure"]
+    assert not framework._rollout_tasks
+
+
 # ---------------------------------------------------------------------------
 # _score_trajectories method-level tests
 # ---------------------------------------------------------------------------
@@ -2084,11 +2212,14 @@ async def test_cancel_during_trajectory_persist_closes_uid(monkeypatch, fake_tq)
         writing.set()
         await asyncio.Event().wait()
 
-    async def episode(**_kwargs):
+    async def episode():
         return [_trajectory()], {"uid": "uid-0"}
 
+    async def submit_episode(**_kwargs):
+        return asyncio.create_task(episode())
+
     monkeypatch.setattr(framework, "_write_session_trajectories_to_tq", block_write)
-    monkeypatch.setattr(framework, "_run_agent_episode_with_concurrency_limit", episode)
+    monkeypatch.setattr(framework, "_submit_agent_episode", submit_episode)
 
     task = asyncio.create_task(
         framework._run_prompt_rollouts(
@@ -2123,11 +2254,14 @@ async def test_cancel_after_persisted_sibling_keeps_finished_uid(monkeypatch, fa
         writing.set()
         await asyncio.Event().wait()
 
-    async def episode(**_kwargs):
+    async def episode():
         return [_trajectory()], {"uid": "uid-0"}
 
+    async def submit_episode(**_kwargs):
+        return asyncio.create_task(episode())
+
     monkeypatch.setattr(framework, "_write_session_trajectories_to_tq", write_then_block)
-    monkeypatch.setattr(framework, "_run_agent_episode_with_concurrency_limit", episode)
+    monkeypatch.setattr(framework, "_submit_agent_episode", submit_episode)
 
     task = asyncio.create_task(
         framework._run_prompt_rollouts(
@@ -2155,7 +2289,7 @@ async def test_repeated_cancel_waits_for_episode_cleanup_and_terminal_status(mon
     cleaning = asyncio.Event()
     release = asyncio.Event()
 
-    async def episode(**_kwargs):
+    async def episode():
         started.set()
         try:
             await asyncio.Event().wait()
@@ -2164,7 +2298,10 @@ async def test_repeated_cancel_waits_for_episode_cleanup_and_terminal_status(mon
             await release.wait()
             raise
 
-    monkeypatch.setattr(framework, "_run_agent_episode_with_concurrency_limit", episode)
+    async def submit_episode(**_kwargs):
+        return asyncio.create_task(episode())
+
+    monkeypatch.setattr(framework, "_submit_agent_episode", submit_episode)
     task = asyncio.create_task(
         framework._run_prompt_rollouts(
             sample_fields={"uid": "uid-0"},

@@ -113,13 +113,17 @@ class AgentFrameworkWorker:
     async def generate_sequences(self, prompts) -> None:
         await self.framework.generate_sequences(prompts)
 
+    async def submit_sessions(self, prompts) -> None:
+        await self.framework.submit_sessions(prompts)
+
 
 class AgentFrameworkRolloutAdapter:
     """Trainer-facing adapter satisfying the `agent_loop_manager_class` contract.
 
     Holds zero recipe-specific logic; every agent-framework recipe wires the
     same class in yaml. The adapter owns the gateway manager (driver-side) and
-    injects it into the framework worker.
+    injects it into the framework worker. Ordinary generation is fire-and-forget;
+    callers that need Runner-slot backpressure use ``submit_sessions`` explicitly.
     """
 
     def __init__(self) -> None:
@@ -162,6 +166,14 @@ class AgentFrameworkRolloutAdapter:
             raise RuntimeError("framework must be initialized before generate_sequences")
 
         self.framework_worker.generate_sequences.remote(prompts)
+        return None
+
+    def submit_sessions(self, prompts) -> None:
+        """Wait for Runner-slot admission without waiting for rollout results."""
+        if self.framework_worker is None:
+            raise RuntimeError("framework must be initialized before submit_sessions")
+
+        ray.get(self.framework_worker.submit_sessions.remote(prompts))
         return None
 
     def generate_sequences_and_wait(self, prompts) -> None:

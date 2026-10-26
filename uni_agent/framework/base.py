@@ -39,3 +39,12 @@ class AgentFramework(ABC):
     async def generate_sequences(self, prompts: TensorDict) -> None:
         """Run agent sessions and write finalized trajectories to TransferQueue."""
         ...
+
+    async def submit_sessions(self, prompts: TensorDict) -> None:
+        """Wait for session admission without waiting for rollout completion.
+
+        Frameworks must opt into this completion boundary explicitly. Falling
+        back to :meth:`generate_sequences` would turn admission backpressure
+        into full-rollout serialization.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support admission-only submission")
