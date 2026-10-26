@@ -443,11 +443,31 @@ Important knobs include:
 - `agent_runners`: Runner import paths and arguments. With multiple entries, each
   registry key must match the sample's `agent_name`.
 - `dispatch_mode`: inline async execution or Ray tasks.
-- `max_concurrent_sessions`: per-Runner concurrency limit.
+- `max_concurrent_sessions`: per-Runner concurrency limit. A permit is held
+  through episode execution, scoring, and cleanup.
 - `log_dir`: runtime log root. Sessions with a global step write `framework.log`, `task.log`, and trajectory artifacts under `step_<global_step>/<log_id>/`; Sessions whose `global_steps` is `None` write directly under `<log_id>/`.
 - `rollout.n`: sessions per prompt.
 - `rollout.multi_turn.format`: model-specific Tool parser.
 - `transfer_queue.enable`: enables asynchronous trajectory storage.
+
+### Admission-only submission
+
+`AgentFrameworkRolloutAdapter` exposes three completion boundaries:
+
+- `generate_sequences(prompts)` submits generation without waiting.
+- `submit_sessions(prompts)` waits until every session has acquired its Runner
+  permit and its episode task has been scheduled, or admission has failed.
+- `generate_sequences_and_wait(prompts)` waits for rollout completion and
+  TransferQueue delivery.
+
+Admission does not mean that a Gateway session has already been created, and its
+return value is not a rollout-success receipt. The Framework keeps owning the
+batch after admission so generation, scoring, cleanup, and result delivery can
+continue asynchronously.
+
+`submit_sessions` is an optional Framework capability. Custom Frameworks that
+do not implement it raise `NotImplementedError`; there is no fallback that
+silently waits for full rollout completion.
 
 ## Sampling Configuration
 
