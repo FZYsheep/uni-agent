@@ -2058,6 +2058,213 @@ async def test_ray_task_termination_cancels_runner_and_aborts_session(monkeypatc
     assert runtime.aborted_sessions, "terminated session must be aborted"
 
 
+async def _framework_for_cancel(fake_tq, *, runner=_async_noop_runner, max_concurrent_sessions=0, n=1):
+    runtime = _FakeGatewayManager({})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={
+            "runner": {
+                **_inline_runner_config(runner),
+                "max_concurrent_sessions": max_concurrent_sessions,
+            }
+        },
+        gateway_manager=runtime,
+        n=n,
+    )
+    return framework, runtime
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_cancel_during_trajectory_persist_closes_uid(monkeypatch, fake_tq):
+    framework, _ = await _framework_for_cancel(fake_tq)
+    writing = asyncio.Event()
+
+    async def block_write(**_kwargs):
+        writing.set()
+        await asyncio.Event().wait()
+
+    async def episode(**_kwargs):
+        return [_trajectory()], {"uid": "uid-0"}
+
+    monkeypatch.setattr(framework, "_write_session_trajectories_to_tq", block_write)
+    monkeypatch.setattr(framework, "_run_agent_episode_with_concurrency_limit", episode)
+
+    task = asyncio.create_task(
+        framework._run_prompt_rollouts(
+            sample_fields={"uid": "uid-0"},
+            sample_index=0,
+            num_sessions=1,
+            global_steps=1,
+            partition_id="train",
+        )
+    )
+    await asyncio.wait_for(writing.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 2)
+
+    assert [put["tag"]["status"] for put in fake_tq.puts] == ["running", "failure"]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_cancel_after_persisted_sibling_keeps_finished_uid(monkeypatch, fake_tq):
+    framework, _ = await _framework_for_cancel(fake_tq, n=2)
+    writing = asyncio.Event()
+    writes = 0
+
+    async def write_then_block(**_kwargs):
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            return
+        writing.set()
+        await asyncio.Event().wait()
+
+    async def episode(**_kwargs):
+        return [_trajectory()], {"uid": "uid-0"}
+
+    monkeypatch.setattr(framework, "_write_session_trajectories_to_tq", write_then_block)
+    monkeypatch.setattr(framework, "_run_agent_episode_with_concurrency_limit", episode)
+
+    task = asyncio.create_task(
+        framework._run_prompt_rollouts(
+            sample_fields={"uid": "uid-0"},
+            sample_index=0,
+            num_sessions=2,
+            global_steps=1,
+            partition_id="train",
+        )
+    )
+    await asyncio.wait_for(writing.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 2)
+
+    assert [put["tag"]["status"] for put in fake_tq.puts] == ["running", "finished"]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_repeated_cancel_waits_for_episode_cleanup_and_terminal_status(monkeypatch, fake_tq):
+    framework, _ = await _framework_for_cancel(fake_tq)
+    started = asyncio.Event()
+    cleaning = asyncio.Event()
+    release = asyncio.Event()
+
+    async def episode(**_kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cleaning.set()
+            await release.wait()
+            raise
+
+    monkeypatch.setattr(framework, "_run_agent_episode_with_concurrency_limit", episode)
+    task = asyncio.create_task(
+        framework._run_prompt_rollouts(
+            sample_fields={"uid": "uid-0"},
+            sample_index=0,
+            num_sessions=1,
+            global_steps=1,
+            partition_id="train",
+        )
+    )
+    await asyncio.wait_for(started.wait(), 2)
+    task.cancel()
+    await asyncio.wait_for(cleaning.wait(), 2)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 2)
+    assert [put["tag"]["status"] for put in fake_tq.puts] == ["running", "failure"]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_repeated_cancel_waits_for_gateway_abort_before_releasing_permit(fake_tq):
+    started = asyncio.Event()
+    abort_started = asyncio.Event()
+    allow_abort = asyncio.Event()
+
+    async def runner(**_kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    class BlockingAbortGateway(_FakeGatewayManager):
+        async def abort_session(self, session_id):
+            abort_started.set()
+            await allow_abort.wait()
+            await super().abort_session(session_id)
+
+    runtime = BlockingAbortGateway({})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={
+            "runner": {
+                **_inline_runner_config(runner),
+                "max_concurrent_sessions": 1,
+            }
+        },
+        gateway_manager=runtime,
+    )
+    task = asyncio.create_task(framework.generate_sequences(_build_prompts(count=1, global_steps=3)))
+    await asyncio.wait_for(started.wait(), 2)
+    task.cancel()
+    await asyncio.wait_for(abort_started.wait(), 2)
+    for _ in range(3):
+        task.cancel()
+        await asyncio.sleep(0)
+
+    assert not task.done()
+    assert framework._runner_semaphores["runner"]._value == 0
+    allow_abort.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 2)
+
+    assert runtime.aborted_sessions == runtime.created_sessions
+    assert framework._runner_semaphores["runner"]._value == 1
+    assert [put["tag"]["status"] for put in fake_tq.puts] == ["running", "failure"]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_cancel_during_running_status_write_preserves_status_order(monkeypatch, fake_tq):
+    framework, runtime = await _framework_for_cancel(fake_tq)
+    writing = asyncio.Event()
+    release = asyncio.Event()
+    put = fake_tq.async_kv_put
+
+    async def put_then_block(**kwargs):
+        await put(**kwargs)
+        if kwargs["tag"]["status"] == "running":
+            writing.set()
+            await release.wait()
+
+    monkeypatch.setattr(fake_tq, "async_kv_put", put_then_block)
+    task = asyncio.create_task(framework.generate_sequences(_build_prompts(count=1, global_steps=3)))
+    await asyncio.wait_for(writing.wait(), 2)
+    task.cancel()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 2)
+
+    assert not runtime.created_sessions
+    assert [put["tag"]["status"] for put in fake_tq.puts] == ["running", "failure"]
+
+
 @pytest.mark.cpu
 @pytest.mark.level0
 @pytest.mark.asyncio

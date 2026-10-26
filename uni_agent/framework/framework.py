@@ -568,15 +568,20 @@ class GatewayAgentFramework(AgentFramework):
         tasks = []
         for sample_index in range(len(prompts)):
             tasks.append(
-                self._run_prompt_rollouts(
-                    sample_fields=self._extract_sample_fields(prompts=prompts, sample_index=sample_index),
-                    sample_index=sample_index,
-                    global_steps=global_steps,
-                    partition_id=partition_id,
-                    num_sessions=num_sessions,
+                asyncio.create_task(
+                    self._run_prompt_rollouts(
+                        sample_fields=self._extract_sample_fields(prompts=prompts, sample_index=sample_index),
+                        sample_index=sample_index,
+                        global_steps=global_steps,
+                        partition_id=partition_id,
+                        num_sessions=num_sessions,
+                    )
                 )
             )
-        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            await self._cancel_and_drain_tasks(tasks)
 
         failure_reasons: list[str] = []
         stats = {
@@ -606,6 +611,52 @@ class GatewayAgentFramework(AgentFramework):
             failure_reasons.extend(outcome["failure_reasons"])
         return stats
 
+    @staticmethod
+    async def _settle_cleanup(cleanup: asyncio.Future) -> bool:
+        """Finish owned cleanup despite repeated cancellation.
+
+        Return whether cancellation interrupted the caller while cleanup was
+        still running.
+        """
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+        cleanup.result()
+        return cancelled
+
+    async def _cancel_and_drain_tasks(self, tasks: list[asyncio.Task]) -> bool:
+        """Cancel owned tasks once and retrieve every terminal outcome."""
+        for task in tasks:
+            cancelling = getattr(task, "cancelling", None)
+            if not task.done() and (cancelling is None or not cancelling()):
+                task.cancel()
+        if not tasks:
+            return False
+        return await self._settle_cleanup(asyncio.gather(*tasks, return_exceptions=True))
+
+    async def _put_uid_status(
+        self,
+        *,
+        uid: str,
+        partition_id: str,
+        status: str,
+        log_failure: bool = False,
+    ) -> None:
+        """Finish a prompt-status write before propagating cancellation."""
+        put = asyncio.create_task(tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": status}))
+        cancelled = False
+        try:
+            cancelled = await self._settle_cleanup(put)
+        except Exception:
+            if not log_failure:
+                raise
+            logger.exception("uid %s: failed to mark status %s", uid, status)
+        if cancelled:
+            raise asyncio.CancelledError()
+
     async def _run_prompt_rollouts(
         self,
         *,
@@ -620,31 +671,42 @@ class GatewayAgentFramework(AgentFramework):
         if uid is None:
             raise ValueError("GatewayAgentFramework requires prompts['uid'] for TransferQueue output")
         uid = str(uid)
-        sampling_params = self._build_session_sampling_params(
-            partition_id=partition_id,
-            sample_fields=sample_fields,
-        )
-
-        # Prompt layer: rollout.n sessions race independently for the same uid.
-        # Successful sessions are written to TQ; failed sessions only affect this uid's stats.
-        await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "running"})
-        tasks = [
-            self._run_agent_episode_with_concurrency_limit(
+        tasks: list[asyncio.Task] = []
+        try:
+            sampling_params = self._build_session_sampling_params(
+                partition_id=partition_id,
                 sample_fields=sample_fields,
-                sample_index=sample_index,
-                session_index=session_index,
-                global_steps=global_steps,
-                sampling_params=sampling_params,
             )
-            for session_index in range(num_sessions)
-        ]
-        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+            # Prompt layer: rollout.n sessions race independently for the same
+            # uid. Successful sessions are written to TQ; failed sessions only
+            # affect this uid's stats.
+            await self._put_uid_status(uid=uid, partition_id=partition_id, status="running")
+            tasks = [
+                asyncio.create_task(
+                    self._run_agent_episode_with_concurrency_limit(
+                        sample_fields=sample_fields,
+                        sample_index=sample_index,
+                        session_index=session_index,
+                        global_steps=global_steps,
+                        sampling_params=sampling_params,
+                    )
+                )
+                for session_index in range(num_sessions)
+            ]
+            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        except BaseException as error:
+            cancelled_during_cleanup = await self._cancel_and_drain_tasks(tasks)
+            await self._put_uid_status(uid=uid, partition_id=partition_id, status="failure", log_failure=True)
+            if cancelled_during_cleanup and not isinstance(error, asyncio.CancelledError):
+                raise asyncio.CancelledError() from error
+            raise
 
         success_sessions = 0
         failed_sessions = 0
         success_outputs = 0
         unfinished_episodes = 0
         failure_reasons: list[str] = []
+        control_flow_error: BaseException | None = None
         for session_index, outcome in enumerate(outcomes):
             if isinstance(outcome, Exception):
                 failed_sessions += 1
@@ -653,7 +715,9 @@ class GatewayAgentFramework(AgentFramework):
             # Propagate control-flow exceptions such as CancelledError/SystemExit;
             # only ordinary Exceptions are treated as isolated rollout failures.
             if isinstance(outcome, BaseException):
-                raise outcome
+                if control_flow_error is None:
+                    control_flow_error = outcome
+                continue
 
             trajectories, session_sample_fields = outcome
             if not trajectories:
@@ -670,6 +734,13 @@ class GatewayAgentFramework(AgentFramework):
                     global_steps=global_steps,
                     partition_id=partition_id,
                 )
+            except asyncio.CancelledError:
+                await self._put_uid_status(
+                    uid=uid,
+                    partition_id=partition_id,
+                    status="finished" if success_sessions > 0 else "failure",
+                )
+                raise
             except Exception as e:
                 logger.exception(f"TQ write failed for uid={uid} session={session_index}: {e}")
                 failed_sessions += 1
@@ -683,11 +754,13 @@ class GatewayAgentFramework(AgentFramework):
                     unfinished_episodes += 1
 
         if success_sessions > 0:
-            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "finished"})
+            await self._put_uid_status(uid=uid, partition_id=partition_id, status="finished")
             failed_uids = 0
         else:
-            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
+            await self._put_uid_status(uid=uid, partition_id=partition_id, status="failure")
             failed_uids = 1
+        if control_flow_error is not None:
+            raise control_flow_error
 
         return {
             "num_success_sessions": success_sessions,
@@ -837,7 +910,9 @@ class GatewayAgentFramework(AgentFramework):
                             timeout=runner_config.session_timeout_seconds,
                         )
                     except (asyncio.TimeoutError, asyncio.CancelledError):
-                        await self._cancel_runner_task(object_ref, session_id)
+                        cleanup = asyncio.ensure_future(self._cancel_runner_task(object_ref, session_id))
+                        if await self._settle_cleanup(cleanup):
+                            raise asyncio.CancelledError() from None
                         raise
                 else:
                     runner = self._inline_runners[runner_name]
@@ -863,7 +938,8 @@ class GatewayAgentFramework(AgentFramework):
                 # Parent shutdown/cancellation must not leave the Gateway route
                 # and actor-owned session live after the runner task is gone.
                 try:
-                    await asyncio.shield(self.gateway_manager.abort_session(session_id))
+                    abort = asyncio.ensure_future(self.gateway_manager.abort_session(session_id))
+                    await self._settle_cleanup(abort)
                 except Exception:
                     logger.exception("session %s: Gateway abort failed during parent cancellation", session_id)
                 raise
