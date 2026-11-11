@@ -2388,6 +2388,24 @@ async def test_admission_cancel_cleans_only_its_own_sessions(fake_tq, prompt_cou
 @pytest.mark.cpu
 @pytest.mark.level0
 @pytest.mark.asyncio
+async def test_session_hooks_default_to_gateway_manager_lifecycle(fake_tq):
+    """The default hooks open and close exactly the session they are given."""
+    runtime = _FakeGatewayManager({"session-sample-0-rollout-0": [_trajectory()]})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
+        gateway_manager=runtime,
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1))
+
+    assert len(runtime.created_sessions) == 1
+    assert runtime.created_sessions == runtime.finalized_sessions
+    assert runtime.aborted_sessions == []
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
 @pytest.mark.parametrize("prompt_count, sessions_per_prompt", [(1, 2), (2, 1)], ids=["uncollected", "collector"])
 async def test_repeated_admission_cancel_waits_for_gateway_abort_before_releasing_permit(
     fake_tq, prompt_count, sessions_per_prompt
@@ -2526,6 +2544,37 @@ async def test_collector_cancel_settles_uid_after_persistence(monkeypatch, fake_
 @pytest.mark.cpu
 @pytest.mark.level0
 @pytest.mark.asyncio
+async def test_session_hooks_pass_sampling_params_as_per_rollout_copies(fake_tq, monkeypatch):
+    """Each rollout's session receives its own copy of the sampling params."""
+    params = {"temperature": 0.1, "top_p": 0.9}
+    monkeypatch.setattr(
+        GatewayAgentFramework,
+        "_build_session_sampling_params",
+        lambda self, **_: params,
+    )
+    runtime = _FakeGatewayManager(
+        {
+            "session-sample-0-rollout-0": [_trajectory()],
+            "session-sample-0-rollout-1": [_trajectory()],
+        }
+    )
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
+        gateway_manager=runtime,
+        n=2,
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1))
+
+    sampling_params = [kwargs["sampling_params"] for kwargs in runtime.created_session_kwargs]
+    assert sampling_params == [params, params]
+    assert sampling_params[0] is not params
+    assert sampling_params[0] is not sampling_params[1]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
 async def test_admission_cancel_during_running_status_write_settles_uid(monkeypatch, fake_tq):
     runtime = _FakeGatewayManager({})
     framework = await _build_framework_with_agent_runners(
@@ -2629,3 +2678,25 @@ async def test_runner_error_survives_gateway_abort_failure():
             sampling_params={},
         )
     assert len(runtime.aborted_sessions) == 1
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_runner_failure_aborts_session_without_finalizing(fake_tq):
+    """A failing runner aborts its session and never closes it."""
+
+    async def _failing_runner(**_):
+        raise RuntimeError("boom")
+
+    runtime = _FakeGatewayManager({})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_failing_runner)},
+        gateway_manager=runtime,
+    )
+
+    with pytest.raises(RuntimeError, match="All rollouts failed"):
+        await framework.generate_sequences(_build_prompts(count=1))
+
+    assert runtime.created_sessions == runtime.aborted_sessions
+    assert runtime.finalized_sessions == []

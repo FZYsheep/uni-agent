@@ -30,9 +30,11 @@ SANDBOX_PLUGIN_MODULES_ENV = "UNI_AGENT_SANDBOX_PLUGINS"
 SANDBOX_MODULES: dict[str, str] = {
     "local": "uni_agent.sandbox.local",
     "docker": "uni_agent.sandbox.docker",
+    "e2b": "uni_agent.sandbox.e2b",
     "modal": "uni_agent.sandbox.modal",
     "vefaas": "uni_agent.sandbox.vefaas",
     "openyuanrong": "uni_agent.sandbox.openyuanrong",
+    "agent_dx": "uni_agent.sandbox.agent_dx",
 }
 
 

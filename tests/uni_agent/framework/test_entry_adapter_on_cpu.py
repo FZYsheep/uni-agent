@@ -47,8 +47,10 @@ def test_adapter_derives_worker_concurrency_from_session_limits(monkeypatch, run
     worker_class = Mock()
     worker_class.options.return_value = worker_class
     gateway = object()
+    ready_get = Mock()
     monkeypatch.setattr(entry_module, "AgentFrameworkWorker", worker_class)
     monkeypatch.setattr(entry_module, "build_gateway_manager", lambda **_: gateway)
+    monkeypatch.setattr(entry_module.ray, "get", ready_get)
     runners = {
         str(index): {} if limit is None else {"max_concurrent_sessions": limit}
         for index, limit in enumerate(runner_limits)
@@ -60,6 +62,10 @@ def test_adapter_derives_worker_concurrency_from_session_limits(monkeypatch, run
     worker_class.options.assert_called_once_with(max_concurrency=expected_concurrency)
     assert worker_class.remote.call_args.kwargs["gateway_manager"] is gateway
     assert adapter.framework_worker is worker_class.remote.return_value
+    ready_get.assert_called_once_with(
+        worker_class.remote.return_value.ready.remote.return_value,
+        timeout=entry_module._FRAMEWORK_READY_TIMEOUT_SECONDS,
+    )
 
 
 @pytest.mark.parametrize(

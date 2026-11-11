@@ -1,8 +1,6 @@
-name: Python Backend CI
+name: tests-cpu
 
 on:
-  push:
-    branches: [ "main", "develop" ]
   pull_request:
     branches: [ "main" ]
     types: [ opened, synchronize, reopened ]
@@ -15,14 +13,21 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  test-and-build:
+  #  detect changes file
+  changes:
+    uses: ./.github/workflows/detect-changes.yml
+
+  # ============ Job: test in cpu ============
+  run:
+    needs: changes
+    if: needs.changes.outputs.cpu == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
-    # tested in multi python version
+    # tested in certain python version
     strategy:
       matrix:
-        python-version: [ "3.11", "3.12" ]
+        python-version: [ "3.12" ]
 
     steps:
       # 1. git clone code
@@ -51,16 +56,27 @@ jobs:
       # 4. Test with pytest
       - name: Test with pytest
         run: |
-          pip install pytest pytest-cov
+          pip install pytest pytest-cov pytest-custom_exit_code
           export PYTHONPATH="${PYTHONPATH}:${GITHUB_WORKSPACE}"
-          pytest tests/uni_agent/ -m="cpu and level0" --cov=./uni_agent/ --cov-report=xml --cov-report=term
+          pytest tests/uni_agent/ -m="cpu and level0" --suppress-no-test-exit-code --cov=./uni_agent/ --cov-report=xml --cov-report=term
 
-      # 5. Upload coverage to Codecov
-      - name: Upload coverage to Codecov
+      - name: Upload CPU coverage
         uses: codecov/codecov-action@v4
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           file: ./coverage.xml
-          flags: unittests
-          name: codecov-umbrella
+          flags: cpu-tests
           fail_ci_if_error: false
+
+  cpu-gate:
+    runs-on: ubuntu-latest
+    needs: [ changes, run ]
+    if: always()
+    steps:
+      - name: Report result
+        run: |
+          if [[ "${{ needs.run.result }}" == "failure" ]]; then
+            echo "CPU CI FAILED"
+            exit 1
+          fi
+          echo "CPU CI SUCCESS"
