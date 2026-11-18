@@ -107,6 +107,11 @@ class Backend:
         )
 
 
+def test_tree_session_rejects_sampler_heads():
+    with pytest.raises(ValueError, match="linear GatewaySession"):
+        TreeGatewaySession(SessionHandle("heads"), FakeContinuousCodec(), sampling_params={"topk_log_probs": 2})
+
+
 async def generate(session, backend, messages, *, logprobs=False, trajectory_capacity=None):
     session._trajectory_capacity = trajectory_capacity
     return await session.run_generation(

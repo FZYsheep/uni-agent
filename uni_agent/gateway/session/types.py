@@ -99,6 +99,9 @@ class Trajectory:
     routed_experts: torch.Tensor | np.ndarray | None = None
     multi_modal_data: dict[str, Any] | None = None
     extra_fields: dict[str, Any] = field(default_factory=dict)
+    response_topk_ids: list[list[int]] | None = None
+    response_topk_log_probs: list[list[float]] | None = None
+    response_support_complete: list[bool] | None = None
 
 
 class SessionRouteReleaseError(Exception):

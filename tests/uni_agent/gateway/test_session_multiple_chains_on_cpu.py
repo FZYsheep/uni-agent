@@ -168,6 +168,59 @@ class _VersionedBackend:
         )
 
 
+@pytest.mark.asyncio
+async def test_sampler_heads_follow_context_rollback_copy_and_length_materialization():
+    import numpy as np
+
+    class HeadBackend(SequencedBackend):
+        async def generate(self, *args, **kwargs):
+            assert kwargs["sampling_params"]["topk_log_probs"] == 2
+            output = await super().generate(*args, **kwargs)
+            output.extra_fields.update(
+                response_topk_ids=[[token, token + 1000] for token in output.token_ids],
+                response_topk_log_probs=[[-0.1, -4.0] for _ in output.token_ids],
+                response_support_complete=np.zeros(len(output.token_ids), dtype=np.bool_),
+            )
+            return output
+
+    session = _session("heads", sampling_params={"topk_log_probs": 2}, enable_last_assistant_rollback=True)
+    first = [{"role": "user", "content": "start"}]
+    backend = HeadBackend(["OLD", "NEW", "NEXT"])
+    await _run(session, backend, first, logprobs=False)
+    rewrite = [*first, {"role": "user", "content": "rewrite"}]
+    await _run(session, backend, rewrite)
+    chain = session.active_chains[0]
+    saved = session._build_materialized_trajectory(chain=chain)
+    saved_heads = [list(row) for row in saved.response_topk_ids]
+    copied = session._copy_trajectory_buffer(chain.buffer)
+    copied.response_topk_ids[-1][0] = -1
+    assert chain.buffer.response_topk_ids[-1][0] == ord("W")
+    messages = [*rewrite, {"role": "assistant", "content": "NEW"}, {"role": "user", "content": "continue"}]
+    await _run(session, backend, messages)
+    assert saved.response_topk_ids == saved_heads
+    trajectory = session._build_materialized_trajectory(
+        chain=session.active_chains[0],
+        extra_fields={"materialization_reason": "max_trajectory_length"},
+    )
+    assert len(trajectory.response_topk_ids) == len(trajectory.response_ids)
+    for token, mask, ids, probs in zip(
+        trajectory.response_ids,
+        trajectory.response_mask,
+        trajectory.response_topk_ids,
+        trajectory.response_topk_log_probs,
+        strict=True,
+    ):
+        if mask:
+            assert ids == [token, token + 1000]
+            assert probs == [-0.1, -4.0]
+        else:
+            assert ids == [0, 1]
+    trainable = "".join(
+        chr(token) for token, mask in zip(trajectory.response_ids, trajectory.response_mask, strict=True) if mask
+    )
+    assert trainable == "NEWNEXT"
+
+
 class _ControlledParallelBackend:
     def __init__(self, steps):
         self.steps = list(steps)

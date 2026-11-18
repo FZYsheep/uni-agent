@@ -118,6 +118,8 @@ class TreeGatewaySession(GatewaySession):
         weight_version: int | None = None,
         generation_metrics: GenerationMetrics | None = None,
     ) -> None:
+        if (sampling_params or {}).get("topk_log_probs"):
+            raise ValueError("sampler top-k metadata requires the linear GatewaySession manager")
         super().__init__(
             handle=handle,
             codec=codec,

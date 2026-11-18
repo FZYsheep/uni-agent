@@ -73,6 +73,9 @@ class TrajectoryBuffer:
     response_ids: list[int] = field(default_factory=list)
     response_mask: list[int] = field(default_factory=list)
     response_logprobs: list[float] = field(default_factory=list)
+    response_topk_ids: list[list[int]] = field(default_factory=list)
+    response_topk_log_probs: list[list[float]] = field(default_factory=list)
+    response_support_complete: list[bool] | None = field(default_factory=list)
     routed_experts: Any | None = None
     generation_versions: list[tuple[int | None, int | None]] = field(default_factory=list)
 
@@ -528,13 +531,18 @@ class GatewaySession:
                     )
 
             runtime_token_ids = encoded.buffer.prompt_ids + encoded.buffer.response_ids
-            merged_token_ids, response_mask, response_logprobs = self._codec.merge_assistant_tokens(
+            k = int(self._sampling_params.get("topk_log_probs", 0) or 0)
+            merged = self._codec.merge_assistant_tokens(
                 runtime_token_ids,
                 response_ids,
                 encoded.buffer.response_mask,
                 encoded.buffer.response_logprobs if encoded.sampling_params.get("logprobs", False) else None,
                 assistant_logprobs=assistant_logprobs,
+                **({"include_merge_result": True} if k else {}),
             )
+            merged_token_ids, response_mask, response_logprobs = merged[:3]
+            if k:
+                self._merge_response_topk(encoded.buffer, merged[3], k=k, assistant_fields=output.extra_fields)
             prompt_length = len(encoded.buffer.prompt_ids)
             if merged_token_ids[:prompt_length] != encoded.buffer.prompt_ids:
                 raise RuntimeError("Continuous Token merge modified the immutable trajectory prompt")
@@ -734,6 +742,9 @@ class GatewaySession:
         messages = request["messages"]
         tools = request["tools"]
         sampling_params = dict(request["sampling_params"])
+        k = int(self._sampling_params.get("topk_log_probs", 0) or 0)
+        if k:
+            sampling_params.update(logprobs=True, topk_log_probs=k)
         mm_processor_kwargs = self._codec.mm_processor_kwargs or {}
         incoming_message_prefix_hashes = self._extend_message_prefix_hashes([], messages)
         selection = self._select_chain(
@@ -781,6 +792,7 @@ class GatewaySession:
                 del buffer.response_ids[rollback_response_len:]
                 del buffer.response_mask[rollback_response_len:]
                 del buffer.response_logprobs[rollback_response_len:]
+                self._truncate_response_topk(buffer, rollback_response_len)
 
                 assistant_prefix = self._codec.turn_separator + self._codec.generation_prompt
                 stored_ids = buffer.prompt_ids if rollback_response_len == 0 else buffer.response_ids
@@ -791,6 +803,7 @@ class GatewaySession:
                 if rollback_response_len:
                     del buffer.response_mask[assistant_prefix_start:]
                     del buffer.response_logprobs[assistant_prefix_start:]
+                    self._truncate_response_topk(buffer, assistant_prefix_start)
                 self._assert_response_logprob_alignment(buffer)
                 incremental_messages = messages[last_assistant_start.message_history_len :]
                 previous_messages = messages[: last_assistant_start.message_history_len]
@@ -822,7 +835,7 @@ class GatewaySession:
                 updated_images = None
                 if image_data is not None or appended_images is not None:
                     updated_images = [*(image_data or []), *(appended_images or [])]
-                merged_token_ids, merged_response_mask, merged_response_logprobs = self._codec.merge_context_tokens(
+                merged = self._codec.merge_context_tokens(
                     previous_messages,
                     updated_messages,
                     runtime_token_ids,
@@ -830,7 +843,9 @@ class GatewaySession:
                     buffer.response_logprobs if sampling_params.get("logprobs", False) else None,
                     tools=tools,
                     image_data=updated_images,
+                    **({"include_merge_result": True} if k else {}),
                 )
+                merged_token_ids, merged_response_mask, merged_response_logprobs = merged[:3]
                 capacity_exhausted = (
                     self._trajectory_capacity is not None and len(merged_token_ids) >= self._trajectory_capacity
                 )
@@ -842,6 +857,8 @@ class GatewaySession:
                 buffer.response_ids = list(merged_token_ids[prompt_length:])
                 buffer.response_mask = list(merged_response_mask)
                 buffer.response_logprobs = list(merged_response_logprobs or [])
+                if k:
+                    self._merge_response_topk(buffer, merged[3], k=k)
                 self._assert_response_logprob_alignment(buffer)
                 if appended_images:
                     if image_data is None:
@@ -1026,6 +1043,11 @@ class GatewaySession:
             response_ids=list(buffer.response_ids),
             response_mask=list(buffer.response_mask),
             response_logprobs=list(buffer.response_logprobs),
+            response_topk_ids=[list(row) for row in buffer.response_topk_ids],
+            response_topk_log_probs=[list(row) for row in buffer.response_topk_log_probs],
+            response_support_complete=(
+                list(buffer.response_support_complete) if buffer.response_support_complete is not None else None
+            ),
             routed_experts=buffer.routed_experts,
             generation_versions=list(buffer.generation_versions),
         )
@@ -1046,6 +1068,29 @@ class GatewaySession:
             0,
             len(buffer.response_ids),
         }, "response_logprobs must be empty or aligned with response_ids"
+        if self._sampling_params.get("topk_log_probs"):
+            for rows in (buffer.response_topk_ids, buffer.response_topk_log_probs, buffer.response_support_complete):
+                if rows is not None and len(rows) != len(buffer.response_ids):
+                    raise RuntimeError("response top-k metadata must align with response_ids")
+
+    @staticmethod
+    def _truncate_response_topk(buffer: TrajectoryBuffer, length: int) -> None:
+        del buffer.response_topk_ids[length:]
+        del buffer.response_topk_log_probs[length:]
+        if buffer.response_support_complete is not None:
+            del buffer.response_support_complete[length:]
+
+    def _merge_response_topk(self, buffer: TrajectoryBuffer, merge_result, *, k: int, assistant_fields=None) -> None:
+        buffer.response_topk_ids, buffer.response_topk_log_probs, buffer.response_support_complete = (
+            self._codec.align_response_topk(
+                merge_result,
+                buffer.response_topk_ids,
+                buffer.response_topk_log_probs,
+                buffer.response_support_complete,
+                k=k,
+                assistant_fields=assistant_fields,
+            )
+        )
 
     def _snapshot_last_assistant_start(
         self,
@@ -1214,6 +1259,13 @@ class GatewaySession:
             response_ids=list(chain.buffer.response_ids),
             response_mask=list(chain.buffer.response_mask),
             response_logprobs=response_logprobs,
+            response_topk_ids=[list(row) for row in chain.buffer.response_topk_ids] or None,
+            response_topk_log_probs=[list(row) for row in chain.buffer.response_topk_log_probs] or None,
+            response_support_complete=(
+                list(chain.buffer.response_support_complete) or None
+                if chain.buffer.response_support_complete is not None
+                else None
+            ),
             num_turns=self._count_chat_turns(chain.message_history),
             chain_id=chain.chain_id,
             routed_experts=chain.buffer.routed_experts,

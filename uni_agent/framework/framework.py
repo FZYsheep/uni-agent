@@ -30,6 +30,7 @@ from uni_agent.logging import LogContext, sample_logging
 from uni_agent.rl_insight.adapter import agent_loop_session
 from uni_agent.tasks import TaskResult
 from verl.tools.tool_registry import initialize_tools_from_config
+from verl.trainer.ppo.score_centering import dummy_rollout_topk, pad_rollout_topk
 from verl.utils import tensordict_utils as tu
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.model import compute_position_id_with_mask
@@ -195,6 +196,9 @@ _TQ_NESTED_SEQUENCE_FIELDS = {
     "attention_mask",
     "position_ids",
     "rollout_log_probs",
+    "rollout_topk_ids",
+    "rollout_topk_log_probs",
+    "rollout_support_complete",
     "routed_experts",
     "rm_scores",
     "teacher_logprobs",
@@ -233,6 +237,9 @@ def _list_of_tq_fields_to_tensordict(fields: list[dict[str, object]]) -> TensorD
     # trajectories; drop any column not present on every sample so the stacker never
     # KeyErrors on a partially-present key (list_of_dict_to_tensordict keys off row 0).
     if fields:
+        for key in ("rollout_topk_ids", "rollout_topk_log_probs"):
+            if any(key in field for field in fields) and not all(key in field for field in fields):
+                raise RuntimeError(f"every score-centering trajectory must contain {key}")
         shared_keys = set(fields[0]).intersection(*(set(f) for f in fields[1:]))
         for f in fields:
             for key in list(f):
@@ -245,7 +252,7 @@ def _list_of_tq_fields_to_tensordict(fields: list[dict[str, object]]) -> TensorD
         values = [field[key] for field in fields]
         if not all(isinstance(value, torch.Tensor) for value in values):
             continue
-        if key == "routed_experts":
+        if key in {"routed_experts", "rollout_topk_ids", "rollout_topk_log_probs", "rollout_support_complete"}:
             ragged_idx = 1  # [seq, layers, topk]: ragged on the sequence dim
         elif key == "position_ids" and values[0].dim() == 2:
             ragged_idx = 2
@@ -537,6 +544,8 @@ class GatewayAgentFramework(AgentFramework):
         # An explicit greedy flag overrides the partition sampling defaults.
         if "__do_sample__" in sample_fields and not bool(sample_fields["__do_sample__"]):
             sampling_params.update(temperature=0, top_p=1.0, top_k=-1)
+        if partition_id != "val" and sampling_params["temperature"] > 0 and config.get("topk_log_probs", 0):
+            sampling_params.update(logprobs=True, topk_log_probs=int(config.topk_log_probs))
         return sampling_params
 
     def record_efficiency_metrics(self, metrics: dict[str, float]) -> None:
@@ -1521,6 +1530,7 @@ class GatewayAgentFramework(AgentFramework):
                 session_index=session_index,
                 global_steps=global_steps,
                 uid=uid,
+                require_topk=partition_id != "val",
             )
             keys.append(f"{uid}_{session_index}_{index}")
             fields.append(field)
@@ -1541,6 +1551,7 @@ class GatewayAgentFramework(AgentFramework):
         session_index: int,
         global_steps: int | None,
         uid: str,
+        require_topk: bool = True,
     ) -> tuple[dict[str, object], dict[str, object]]:
         prompts = torch.tensor(trajectory.prompt_ids, dtype=torch.long)
         responses = torch.tensor(trajectory.response_ids, dtype=torch.long)
@@ -1585,6 +1596,29 @@ class GatewayAgentFramework(AgentFramework):
         }
         if trajectory.response_logprobs is not None:
             field["rollout_log_probs"] = torch.tensor(trajectory.response_logprobs, dtype=torch.float32)
+        k = int(self._rollout_config.get("topk_log_probs", 0) or 0) if self._rollout_config is not None else 0
+        if k and require_topk:
+            if not prompts.numel():
+                raise RuntimeError("score centering requires a nonempty prompt")
+            ids, probs = trajectory.response_topk_ids, trajectory.response_topk_log_probs
+            if ids is None or probs is None:
+                if source_response_mask.any():
+                    raise RuntimeError("trainable trajectory is missing sampler top-k heads")
+                ids, probs = dummy_rollout_topk(responses.numel(), k)
+            ids = torch.as_tensor(ids, dtype=torch.int32)
+            probs = torch.as_tensor(probs, dtype=torch.float32)
+            if not responses.numel():
+                ids, probs = ids.reshape(0, k), probs.reshape(0, k)
+            if ids.shape != (responses.numel(), k) or probs.shape != ids.shape:
+                raise RuntimeError("sampler top-k shape does not match response length and configured K")
+            field["rollout_topk_ids"], field["rollout_topk_log_probs"] = pad_rollout_topk(ids, probs, prompts.numel())
+            receipt = torch.zeros_like(input_ids, dtype=torch.bool)
+            if trajectory.response_support_complete is not None:
+                values = torch.as_tensor(trajectory.response_support_complete, dtype=torch.bool)
+                if values.shape != responses.shape:
+                    raise RuntimeError("sampler support receipt must align with response tokens")
+                receipt[prompts.numel() - 1 : input_ids.numel() - 1] = values
+            field["rollout_support_complete"] = receipt
         if trajectory.routed_experts is not None:
             aligned_experts = _align_routed_experts(trajectory.routed_experts, input_ids.size(0))
             if aligned_experts is not None:

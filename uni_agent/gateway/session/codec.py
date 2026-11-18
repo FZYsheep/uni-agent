@@ -295,7 +295,12 @@ class MessageCodec:
         response_logprobs: list[float] | None = None,
         *,
         assistant_logprobs: list[float] | None = None,
-    ) -> tuple[list[int], list[int], list[float] | None] | MergeResult:
+        include_merge_result: bool = False,
+    ) -> (
+        tuple[list[int], list[int], list[float] | None]
+        | tuple[list[int], list[int], list[float] | None, MergeResult]
+        | MergeResult
+    ):
         """Merge model-generated tokens and align response metadata."""
         merge_result = self._continuous_token_builder.merge_assistant_tokens(
             runtime_token_ids,
@@ -309,7 +314,49 @@ class MessageCodec:
             response_logprobs,
             assistant_logprobs=assistant_logprobs,
         )
-        return merge_result.token_ids, response_mask, response_logprobs
+        aligned = (merge_result.token_ids, response_mask, response_logprobs)
+        return (*aligned, merge_result) if include_merge_result else aligned
+
+    @staticmethod
+    def align_response_topk(
+        merge_result: MergeResult,
+        ids: list[list[int]],
+        log_probs: list[list[float]],
+        support_complete: list[bool] | None,
+        *,
+        k: int,
+        assistant_fields: dict[str, Any] | None = None,
+    ) -> tuple[list[list[int]], list[list[float]], list[bool] | None]:
+        """Apply the same CT edit to sampler heads; masked rows use verl's dummy head."""
+        from verl.trainer.ppo.score_centering import dummy_rollout_topk
+
+        retained = max(0, len(ids) - merge_result.removed_prefix_token_count)
+        inserted = len(merge_result.inserted_token_ids)
+        context = merge_result.appended_token_count if merge_result.kind == "context" else 0
+        dummy_ids, dummy_probs = dummy_rollout_topk(inserted + context, k)
+        aligned_ids = ids[:retained] + dummy_ids.tolist()
+        aligned_probs = log_probs[:retained] + dummy_probs.tolist()
+        receipt = support_complete[:retained] + [False] * (inserted + context) if support_complete is not None else None
+        if merge_result.kind == "assistant" and merge_result.appended_token_count:
+            fields = assistant_fields or {}
+            count = merge_result.appended_token_count
+            for name in ("response_topk_ids", "response_topk_log_probs"):
+                rows = fields.get(name)
+                if rows is None or len(rows) != count or any(len(row) != k for row in rows):
+                    raise RuntimeError(f"backend {name} must have shape [{count}, {k}]")
+            aligned_ids += [list(row) for row in fields["response_topk_ids"]]
+            aligned_probs += [list(row) for row in fields["response_topk_log_probs"]]
+            assistant_receipt = fields.get("response_support_complete")
+            if assistant_receipt is not None and hasattr(assistant_receipt, "tolist"):
+                assistant_receipt = assistant_receipt.tolist()
+            if assistant_receipt is not None and (
+                len(assistant_receipt) != count or any(type(value) is not bool for value in assistant_receipt)
+            ):
+                raise RuntimeError("backend response_support_complete must contain one bool per token")
+            receipt = (
+                receipt + list(assistant_receipt) if receipt is not None and assistant_receipt is not None else None
+            )
+        return aligned_ids, aligned_probs, receipt
 
     def validate_incremental_media(self, messages: list[dict[str, Any]]) -> None:
         """Reject appended media unsupported by the Gateway or selected builder."""
@@ -343,7 +390,12 @@ class MessageCodec:
         tools: list[dict[str, Any]] | None = None,
         image_data: list[Any] | None = None,
         video_data: list[Any] | None = None,
-    ) -> tuple[list[int], list[int], list[float] | None] | MergeResult:
+        include_merge_result: bool = False,
+    ) -> (
+        tuple[list[int], list[int], list[float] | None]
+        | tuple[list[int], list[int], list[float] | None, MergeResult]
+        | MergeResult
+    ):
         """Merge prepared context and align response metadata.
 
         image_data covers all updated_messages, including history, in block order.
@@ -393,7 +445,8 @@ class MessageCodec:
             response_mask,
             response_logprobs,
         )
-        return merge_result.token_ids, response_mask, response_logprobs
+        aligned = (merge_result.token_ids, response_mask, response_logprobs)
+        return (*aligned, merge_result) if include_merge_result else aligned
 
     def _process_tool_calls_sglang(
         self,
